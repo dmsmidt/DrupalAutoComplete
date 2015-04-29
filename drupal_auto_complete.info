@@ -1,0 +1,4 @@
+name = Search Auto Complete
+description = Provides autocomplete on a search field
+core = 7.x
+package = Mulino Media

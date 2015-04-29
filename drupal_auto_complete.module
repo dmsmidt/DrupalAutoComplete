@@ -1,0 +1,382 @@
+<?php
+
+define('SEARCH_RESULTS_AMOUNT', 12);
+
+/**
+ * Define search related blocks
+ * Using blocks to make it easy to reuse them later when needed in combination with context
+ *
+ * Implements hook_block_info().
+ */
+function drupal_auto_complete_block_info() {
+  $blocks = array();
+
+  // Search form with expanded browse section
+  $blocks['drupal_auto_complete_browse'] = array(
+    'info' => t('Search form'),
+    'cache' => DRUPAL_CACHE_PER_PAGE,
+  );
+
+  return $blocks;
+}
+
+/**
+ * Implements hook_block_view().
+ */
+function drupal_auto_complete_block_view($delta, $search_string = '', $filters = array()) {
+  $block = array();
+
+  switch ($delta) {
+    case 'drupal_auto_complete_browse':
+
+      $search_form = drupal_get_form('drupal_auto_complete_search_form');
+
+      $block['subject'] = t('Search');
+      $block['content'] = array(
+        '#theme' => 'drupal_auto_complete_block',
+        '#search_form' => $search_form,
+        '#search_string' => $search_string,
+      );
+    break;
+  }
+
+  return $block;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function drupal_auto_complete_theme() {
+  $theme_hooks = array(
+    'drupal_auto_complete_block' => array(
+      'template' => 'search-block',
+      'variables' => array(
+        'search_form' => array(),
+        'slides' => array(),
+        'countries_with_cities' => array(),
+        'search_string' => '',
+        'filters' => array(),
+      ),
+    ),
+    'drupal_auto_complete_results' => array(
+      'template' => 'search-results',
+      'variables' => array(
+        'search_block' => array(),
+        'title' => '',
+        'results' => '',
+        'load_more' => array(),
+      ),
+    ),
+  );
+
+  return $theme_hooks;
+}
+
+/**
+ * Implements hook_menu().
+ */
+function drupal_auto_complete_menu() {
+  $items = array();
+
+  $items['search'] = array(
+    'title' => 'Search',
+    'access callback' => 'user_access',
+    'access arguments' => array('access content'),
+    'page callback' => 'drupal_auto_complete_page_view',
+    'type' => MENU_CALLBACK,
+  );
+
+  $items['search/%'] = array(
+    'title' => 'Search results',
+    'access callback' => 'user_access',
+    'access arguments' => array('access content'),
+    'page callback' => 'drupal_auto_complete_page_results_view',
+    'page arguments' => array(1),
+    'type' => MENU_CALLBACK,
+  );
+
+  $items['search_load_more/%/%/%'] = array(
+    'title' => 'Search load more',
+    'access callback' => 'user_access',
+    'access arguments' => array('access content'),
+    'page callback' => 'drupal_auto_complete_ajax_load_more',
+    'page arguments' => array(1, 2, 3),
+    'type' => MENU_CALLBACK,
+  );
+
+  $items['search_autocomplete/%'] = array(
+    'title' => 'Search autocomplete',
+    'access callback' => 'user_access',
+    'access arguments' => array('access content'),
+    'page callback' => 'drupal_auto_complete_ajax_get_suggestions',
+    'page arguments' => array(1),
+    'type' => MENU_CALLBACK,
+    'delivery callback' => 'drupal_auto_complete_ajax_callback',
+  );
+
+  return $items;
+}
+
+/**
+ * Page callback for the search page
+ */
+function drupal_auto_complete_page_view() {
+  // Get search block
+  $search_block = module_invoke('drupal_auto_complete', 'block_view', 'drupal_auto_complete_browse');
+
+  return array(
+    'search' => $search_block['content'],
+  );
+}
+
+/**
+ *
+ * Page callback for the search page
+ *
+ * @param string $search_type
+ *   The type of search/browse action, either 'search', 'city' or 'country'.
+ * @param string $search_string
+ *   The string to search for or the uuid of the object being browsed.
+ * @param string $filter_type
+ * @param string $filter_lang
+ * @return mixed[]
+ *   A Drupal render array.
+ * @throws \Exception
+ */
+function drupal_auto_complete_page_results_view($search_type, $search_string) {
+  $search_block = module_invoke('drupal_auto_complete', 'block_view', 'drupal_auto_complete_browse', $search_string);
+  $output = array(
+    '#theme' => 'drupal_auto_complete_results',
+    '#search_block' => $search_block['content'],
+  );
+
+  // Do a search, limit to the 12 + 1 most popular results
+  // We only show 12, but get 13 to see if there are more items
+  $objects = drupal_auto_complete_get_compact_objects($search_type, $search_string, SEARCH_RESULTS_AMOUNT + 1, 0, $filter_lang, $includes, 'popularity', $filter_type);
+
+  $count = count($objects);
+
+  // @todo Redirect to page when only one result is found and we are on a search page
+  if ($count == 1 && $search_type == 'search') {
+    drupal_goto('');
+  }
+  // If we have multiple results from our query,
+  elseif ($count > 0) {
+    drupal_add_js(drupal_get_path('module', 'drupal_auto_complete') . '/js/search-results.js');
+    // Check if we need a load more link
+    $load_more_type = FALSE;
+    if ($count > SEARCH_RESULTS_AMOUNT) {
+      $load_more_type = $search_type;
+      $output['#load_more'] = array(
+        'search-offset' => SEARCH_RESULTS_AMOUNT,
+        'search-string' => $search_string,
+      );
+    }
+
+    $output['#results'] = drupal_auto_complete_build_results($objects);
+  }
+
+  return $output;
+
+}
+
+/**
+ * Builds the search form.
+ */
+function drupal_auto_complete_search_form() {
+  $form = array();
+
+  // Get path arguments
+  $args = arg();
+
+  $form['#attributes'] = array(
+    'class' => array('search-form'),
+  );
+
+  $form['fulltext'] = array(
+    '#type' => 'textfield',
+    '#required' => TRUE,
+    '#attributes' => array(
+      'class' => array('search-input'),
+      'placeholder' => t('Search (enter location or keyword)'),
+    ),
+  );
+
+  if ($args[0] == 'search' && !empty($args[1])) {
+    $form['fulltext']['#default_value'] = $args[1];
+  }
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Search'), // @todo check if this works with multilingual, ajax often breaks here
+    '#attributes' => array(
+      'tabindex' => '-1',
+    ),
+  );
+
+  // Determine where we are and render the 'goto' links
+  $form['suggestions'] = array(
+    '#type' => 'container',
+    '#attributes' => array(
+      'class' => array('suggestions-wrapper'),
+    ),
+  );
+
+   $form['#attached']['js'][] = array(
+    'data' => drupal_get_path('module', 'drupal_auto_complete') . '/js/search-block.js',
+    'type' => 'file',
+  );
+
+  $form['#submit'] = array('drupal_auto_complete_form_submit');
+
+  return $form;
+}
+
+/**
+ * Form submit callback
+ *
+ * Use the search form input to form URL and provide this string as input for the result page
+ *
+ * @param $form
+ * @param $form_state
+ */
+function drupal_auto_complete_form_submit($form, &$form_state) {
+  // Use user submitted string from search form to create url to result page
+  $redirect_url = 'search/';
+  // Do not sanitize user input here, it will be sanitized in the page callback.
+  // Replace some characters as they may break the URL.
+  $redirect_url .= strtr($form_state['values']['fulltext'], '/', ' ');
+  $form_state['redirect'] = $redirect_url;
+}
+
+/**
+ * Page callback for AJAX autocomplete results
+ *
+ * Use search string to find corresponding objects which form search suggestion.
+ *
+ * @param string $search_string
+ *  (part of) search request entered by user
+ * @return array
+ *  Render array with node titles as links to their node pages.
+ */
+function drupal_auto_complete_ajax_get_suggestions($search_string = '') {
+  // Sanitize search input.
+  $search_string = filter_xss(check_plain($search_string));
+  // Remove whitespace from start and end
+  $search_string = trim($search_string);
+
+  // Can I get the data from the cache?
+
+  // Create the cid
+  $cid = 'drupal_auto_complete_suggestions:'. $search_string;
+
+  // Do we have a cache hit?
+  if($cache = cache_get($cid, 'cache_page')) {
+    // Use the cached data
+    $suggestion = $cache->data;
+  }
+  else {
+    // @todo Do a search, limit to 6 most popular results
+    $objects = array();
+
+    $results = array();
+    // If we have results from our query, collect them to an array als links.
+    if (count($objects)) {
+      foreach($objects as $object ) {
+
+        $link_title = filter_xss($object->getTitle());
+
+        // @todo create links
+        $results[] = $link_title;
+      }
+      $results[] = l(t('See all search results'), 'search/' . $search_string);
+    }
+    // Create unordered list from result set as render array.
+    $suggestion =  array(
+      'suggestions' => array(
+        '#items' => $results,
+        '#theme' => 'item_list',
+        '#attributes' => array(
+          'class' => array('search-suggestions'),
+        ),
+      ),
+    );
+
+    // Store output in the cache
+    cache_set($cid, $suggestion, 'cache_page', CACHE_TEMPORARY);
+  }
+
+  return $suggestion;
+}
+
+/**
+ * Build a render array with results (and load more link when needed)
+ *
+ * @param $object
+ * @return string
+ *   Rendered results
+ */
+function drupal_auto_complete_build_results($objects) {
+  $search_results = '';
+
+  // Unset the last object, we don't want to show it
+  unset($objects[SEARCH_RESULTS_AMOUNT]);
+
+  // Results are only tours and museums!
+  foreach ($objects as $object) {
+    $search_results .= render($object);
+  }
+
+  return $search_results;
+}
+
+/**
+ * Search results AJAX load more page callback
+ * Delivers JSON with info whether to show a load more, the next search offset and the rendered results
+ *
+ * @param string $search_string
+ *   The string to search or browse.
+ * @param int $offset
+ *   The number of items to skip when performing the search query.
+ * @param string $filter_type
+ * @param string $filter_lang
+ */
+function drupal_auto_complete_ajax_load_more($search_string, $offset, $filter_type = 'all', $filter_lang = 'all') {
+  $return = array();
+
+  // @todo Get objects
+  $objects = array();
+
+  // Check if we need a load more link
+  $load_more_type = FALSE;
+  if (count($objects) > SEARCH_RESULTS_AMOUNT) {
+    $return['load_more'] = true;
+  }
+  else {
+    $return['load_more'] = false;
+  }
+
+  // Set the new search offset for the load more link
+  $return['offset'] = $offset + SEARCH_RESULTS_AMOUNT;
+  // Create the loaded search results HTML
+  $return['results'] =  drupal_auto_complete_build_results($objects);
+
+  // Deliver JSON
+  drupal_json_output($return);
+
+  // Perform end-of-request tasks.
+  ajax_footer();
+}
+
+/**
+ * Delivery callback for the autocomplete AND load more AJAX search
+ * @param mixed[] $page_callback_result
+ *   A drupal render array.
+ */
+function drupal_auto_complete_ajax_callback($page_callback_result = array()) {
+  // Only render content
+  print drupal_render($page_callback_result);
+
+  // Perform end-of-request tasks.
+  ajax_footer();
+}
